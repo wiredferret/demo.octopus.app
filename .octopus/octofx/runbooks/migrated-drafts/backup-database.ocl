@@ -1,0 +1,154 @@
+name = "💾 Back up database"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        **Action**: Back up the OctoFX database.
+        
+        **Affects**: OctoFX Database, OctoFX Web Site, OctoFX Service, Database Administrators, Operations, Customer Support
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "run-an-azure-script" {
+        name = "🔍 Inspect existing backup"
+
+        action "inspect-existing-backup" {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "#{OctoFX.Azure.Account}"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $storageAccount = $OctopusParameters["Azure.Storage.AccountName"]
+                    $storageKey = $OctopusParameters["Azure.Storage.Key"]
+                    $databaseName = $OctopusParameters["OctoFX.Database.Name"]
+                    $backupFilename = "${databaseName}.bacpac"
+                    
+                    try {
+                      $backup = az storage blob show --account-name $storageAccount --account-key $storageKey --container-name "backups" --name $backupFilename
+                      $backup = $backup | ConvertFrom-Json
+                    
+                      $lastModified = [DateTime]$backup.properties.lastModified
+                      $lastModified = $lastModified.ToString("MM/dd/yyyy HH:mm:ss")
+                      
+                      Set-OctopusVariable -name BackupExists -value $true
+                      Set-OctopusVariable -name LastModified -value $lastModified
+                      
+                    } catch {
+                      Set-OctopusVariable -name BackupExists -value $false
+                      exit 0
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "OctoFX.WorkerPool"
+        }
+    }
+
+    step "confirm-overwrite-of-existing-backup" {
+        condition = "Variable"
+        name = "✅ Confirm overwrite of existing backup"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔍 Inspect existing backup].Output.BackupExists}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    There is an existing backup that was last modified on #{Octopus.Action[🔍 Inspect existing backup].Output.LastModified}.
+                    
+                    Please confirm whether to overwrite the existing backup.
+                    EOT
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "inspect-existing-backup-clone-1" {
+        condition = "Variable"
+        name = "🗑️ Delete existing backup"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔍 Inspect existing backup].Output.BackupExists}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "#{OctoFX.Azure.Account}"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $storageAccount = $OctopusParameters["Azure.Storage.AccountName"]
+                    $storageKey = $OctopusParameters["Azure.Storage.Key"]
+                    $databaseName = $OctopusParameters["OctoFX.Database.Name"]
+                    $backupFilename = "${databaseName}.bacpac"
+                    
+                    $backup = az storage blob delete --account-name $storageAccount --account-key $storageKey --container-name "backups" --name $backupFilename
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "OctoFX.WorkerPool"
+        }
+    }
+
+    step "backup-database" {
+        name = "💾 Backup database"
+
+        action {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "#{OctoFX.Azure.Account}"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $storageAccount = $OctopusParameters["Azure.Storage.AccountName"]
+                    $storageKey = $OctopusParameters["Azure.Storage.Key"]
+                    
+                    $sqlServerName = "octo-demo"
+                    $databaseName = $OctopusParameters["OctoFX.Database.Name"]
+                    $resourceGroup = "demo.octopus.app"
+                    $sqlServerUsername = $OctopusParameters["OctoFX.Database.User"]
+                    $sqlServerPassword = $OctopusParameters["OctoFX.Database.UserPassword"]
+                    
+                    $backupFilename = "${databaseName}.bacpac"
+                    
+                    az sql db export -s $sqlServerName -n $databaseName -g $resourceGroup -u $sqlServerUsername -p $sqlServerPassword --storage-key-type StorageAccessKey --storage-key $storageKey --storage-uri "https://$storageAccount.blob.core.windows.net/backups/$backupFilename" --verbose
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "OctoFX.WorkerPool"
+        }
+    }
+
+    step "notify-stakeholders" {
+        name = "📨 Notify stakeholders"
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the OctoFX - 💾 Back up database runbook in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The existing database backup was created on #{Octopus.Action[🔍 Inspect existing backup].Output.LastModified}.
+                    <br><br>
+                    View the Runbook logs at #{Global.Octopus.ServerUrl}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - 💾 Back up OctoFX database"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+            worker_pool_variable = ""
+        }
+    }
+}

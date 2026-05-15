@@ -1,0 +1,87 @@
+name = "🛠️ Configure web server"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        **Action**: Configure a newly registered web server to have the prerequisites for running OctoFX.
+        
+        **Affects**: Operations
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "install-windows-features" {
+        name = "⚙️ Install Windows Features"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = "Install-WindowsFeature -name Web-Server,Web-Asp-Net,Web-Asp-Net45 -IncludeManagementTools"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "delete-default-web-site" {
+        name = "🗑️ Delete Default Web Site"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    Import-Module WebAdministration
+                    
+                    $default = "IIS:\Sites\Default Web Site\"
+                    
+                    if (Test-Path $default) {
+                        Write-Highlight "Removing Default Web Site."
+                        Remove-WebSite -Name "Default Web Site"
+                    }
+                    else {
+                        Write-Highlight "Default Web Site not found."
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "notify-stakeholders" {
+        name = "📨 Notify stakeholders"
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the OctoFX - 🗑️ ⚙️ Configure web server runbook in #{Octopus.Environment.Name}.
+                    <br><br>
+                    View the Runbook logs at #{Global.Octopus.ServerUrl}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - ⚙️ Configure OctoFX web server"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+            worker_pool_variable = ""
+        }
+    }
+}

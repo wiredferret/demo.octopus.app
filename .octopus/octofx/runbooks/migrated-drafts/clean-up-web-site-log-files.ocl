@@ -1,0 +1,239 @@
+name = "🗑️ Clean up web site log files"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        **Action**: Archive logs older than 30 days and then delete them.
+        
+        **Affects**: OctoFX Web Site, Customer Support
+        
+        **Resolves**: Disk space issues
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "inspect-machines" {
+        name = "🔍 Inspect machine"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action "inspect-machine" {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $filesToArchive = Get-ChildItem "C:\\inetpub\logs\LogFiles\W3SVC1\*.log"
+                    $filesToArchive = $filesToArchive | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+                    
+                    $details = @()
+                    $filesToArchive | ForEach-Object {
+                        $details += "  * $($_.FullName)"
+                    }
+                    
+                    $details = $details -join "`r`n" | Out-String
+                    Write-Verbose $details
+                    Set-OctopusVariable -Name FilesToArchive -Value $details
+                    Set-OctopusVariable -Name NumberOfFiles -Value $filesToArchive.Count
+                    
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "analyze-state" {
+        name = "🔬 Analyze state"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $machines = @()
+                    
+                    #{each machine in Octopus.Action[🔍 Inspect machine].Output}
+                     $machines += "#{machine}"
+                    #{/each}
+                    
+                    $machines = $machines | Sort-Object
+                    
+                    $archiveDetails = @()
+                    $deleteDetails = @()
+                    
+                    $machines | ForEach-Object {
+                      $count = $OctopusParameters["Octopus.Action[🔍 Inspect machine].Output[$_].NumberOfFiles"]
+                      $total += $count
+                      
+                      if ($count -eq 0) {
+                      	return
+                      }
+                      
+                      $filesToArchive = $OctopusParameters["Octopus.Action[🔍 Inspect machine].Output[$_].FilesToArchive"]
+                    
+                      $archiveDetails += "* **$_**"  
+                      $archiveDetails += $filesToArchive  
+                      $archiveDetails += ""
+                    }
+                    
+                    $archiveDetails = $archiveDetails -join "`r`n" | Out-String
+                    
+                    Write-Verbose $archiveDetails
+                    
+                    Set-OctopusVariable -name "FilesToArchive" -value $archiveDetails
+                    
+                    $createdBy = $OctopusParameters["Octopus.Deployment.CreatedBy.Id"]
+                    $manualRun = ($createdBy -ne 'users-system')
+                    
+                    Set-OctopusVariable -name "HasFiles" -value ($total -gt 0)
+                    Set-OctopusVariable -name "ManualRun" -value $manualRun
+                    Set-OctopusVariable -name "NeedsConfirmation" -value ($manualRun -and $total -gt 0)
+                    Set-OctopusVariable -name "SendNotification" -value ($manualRun -and $total -gt 0)
+                    
+                    if ($total -eq 0) {
+                    	Write-Highlight "No files found to archive and delete."
+                        Write-Warning "No files found to archive and delete."
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+        }
+    }
+
+    step "confirm-cleanup-of-log-files" {
+        condition = "Variable"
+        name = "✅ Confirm cleanup of log files"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.NeedsConfirmation}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    The following files will be archived and deleted:
+                    
+                    #{Octopus.Action[🔬 Analyze state].Output.FilesToArchive}
+                    
+                    Please confirm whether to continue with the cleanup.
+                    
+                    EOT
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "archive-existing-log-files" {
+        condition = "Variable"
+        name = "🗄️ Archive existing log files"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.HasFiles}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $targetName = $OctopusParameters["Octopus.Machine.Name"]
+                    $path = "$($targetName)-web-logs"
+                    
+                    New-Item -Path $path -ItemType Directory
+                    
+                    $files = Get-ChildItem "C:\\inetpub\logs\LogFiles\W3SVC1\*.log"
+                    $files = $files | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+                    
+                    $files | ForEach-Object {
+                    	Write-Host "Copying $($_.FullName)"
+                        Copy-Item $_.FullName -Destination $path
+                    }
+                    
+                    $options = @{
+                      Path = "$path\*.log"
+                      CompressionLevel = "Fastest"
+                      DestinationPath = "$path.zip"
+                    }
+                    
+                    Compress-Archive @options
+                    
+                    New-OctopusArtifact "$path.zip"
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "clean-up-log-files" {
+        condition = "Variable"
+        name = "🗑️ Delete files older than 30 days"
+        properties = {
+            Octopus.Action.MaxParallelism = "1"
+            Octopus.Action.TargetRoles = "octofx-web"
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.HasFiles}#{/unless}"
+        }
+
+        action "delete-files-older-than-30-days" {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $files = Get-ChildItem "C:\\inetpub\logs\LogFiles\W3SVC1\*.log"
+                    $files = $files | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+                    
+                    $files | ForEach-Object {
+                    	Write-Host "Deleting $($_.FullName)"
+                    	Remove-Item -Path $_.FullName -Force
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "notify-stakeholders" {
+        condition = "Variable"
+        name = "📨 Notify stakeholders"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.SendNotification}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the OctoFX - 🗑️ Clean up web site log files runbook in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The following files were archived and deleted:
+                    <br><br>
+                    #{Octopus.Action[🔬 Analyze state].Output.FilesToArchive | Markdown}
+                    <br><br>
+                    View the Runbook logs at #{Global.Octopus.ServerUrl}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - 🗑️ Clean up OctoFX web site log files"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+            worker_pool_variable = ""
+        }
+    }
+}

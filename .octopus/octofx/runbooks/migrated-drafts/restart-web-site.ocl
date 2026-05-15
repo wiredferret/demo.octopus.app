@@ -1,0 +1,254 @@
+name = "♻️ Restart web site"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        **Action**: Restart the OctoFX IIS Site if it is returning something other than an OK (200) result.
+        
+        **Affects**: OctoFX Web Site, Customer Success, Customer Support, Sales
+        
+        **Resolves**: HTTP 500, connections issues, browser timeouts
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "inspect-site" {
+        name = "🔍 Inspect site"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $URI = $OctopusParameters["OctoFX.TradingSite.Url"]
+                    
+                    Write-Host "Making request to $URI"
+                    try
+                    {
+                        $response = Invoke-WebRequest -Uri $URI -UseBasicParsing
+                        $statusCode = $response.StatusCode
+                    } catch {
+                        $statusCode = $_.Exception.Response.StatusCode.value__
+                    }
+                    
+                    Write-Host "The result of the request was $statusCode"
+                    
+                    Set-OctopusVariable -name "WebSiteBroken" -value ($statusCode -ne 200)
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "inspect-octofx-web-site" {
+        name = "📁 Collect logs"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action "collect-logs" {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $targetName = $OctopusParameters["Octopus.Machine.Name"]
+                    $path = "$($targetName)-web-logs"
+                    
+                    New-Item -Path $path -ItemType Directory
+                    
+                    $files = Get-ChildItem "C:\\inetpub\logs\LogFiles\W3SVC1"
+                    $files = $files | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-2) }
+                    
+                    $files | ForEach-Object {
+                    	Write-Host "Copying $($_.FullName)"
+                        Copy-Item $_.FullName -Destination $path
+                    }
+                    
+                    $options = @{
+                      Path = "$path\*.log"
+                      CompressionLevel = "Fastest"
+                      DestinationPath = "$path.zip"
+                    }
+                    
+                    Compress-Archive @options
+                    
+                    New-OctopusArtifact "$path.zip"
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "analyze-state" {
+        name = "🔬 Analyze state"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $machines = @()
+                    
+                    #{each machine in Octopus.Action[🔍 Inspect site].Output}
+                     $machines += "#{machine}"
+                    #{/each}
+                    
+                    $machines = $machines | Sort-Object
+                    
+                    $allBroken = $true
+                    $details = @()
+                    
+                    $machines | ForEach-Object {
+                      $webSiteBroken = $OctopusParameters["Octopus.Action[🔍 Inspect site].Output[$_].WebSiteBroken"]
+                      
+                      Write-Host "Checking $_"
+                      
+                      $webSiteBroken = ($webSiteBroken -eq "True")
+                      $allBroken = $allBroken -and $webSiteBroken
+                    
+                      $state = "* Request to $_ was successful."
+                      if ($webSiteBroken) {
+                      	$state = "* Request to $_ was **unsuccessful**."
+                      }
+                      $details += $state
+                    }
+                    
+                    $createdBy = $OctopusParameters["Octopus.Deployment.CreatedBy.Id"]
+                    $manualRun = ($createdBy -ne 'users-system')
+                    
+                    Set-OctopusVariable -name "ManualRun" -value $manualRun
+                    Set-OctopusVariable -name "NeedsConfirmation" -value (-not $allBroken -and $manualRun)
+                    
+                    $details = $details -join "`r`n" | Out-String
+                    
+                    Set-OctopusVariable -name "Details" -value $details
+                    
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = "OctoFX.WorkerPool"
+        }
+    }
+
+    step "manual-intervention-required" {
+        condition = "Variable"
+        name = "✅ Confirm restart if any sites return ok status"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.NeedsConfirmation}#{/unless}"
+        }
+
+        action "confirm-restart-if-any-sites-return-ok-status" {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    The results of the web site checks were:
+                    
+                    #{Octopus.Action[🔬 Analyze state].Output.Details}
+                    
+                    Please confirm whether to continue with the restart.
+                    
+                    EOT
+            }
+        }
+    }
+
+    step "rectify" {
+        name = "🔨 Rectify"
+        properties = {
+            Octopus.Action.MaxParallelism = "1"
+            Octopus.Action.TargetRoles = "octofx-web"
+        }
+
+        action "restart-site" {
+            name = "♻️ Restart site"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Template.Id = "ActionTemplates-5942"
+                Octopus.Action.Template.Version = "11"
+                WebsiteName = "#{OctoFX.TradingSite.Name}"
+            }
+            worker_pool_variable = ""
+        }
+
+        action "verify-site" {
+            action_type = "Octopus.Script"
+            name = "🔍 Verify site"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $URI = $OctopusParameters["OctoFX.TradingSite.Url"]
+                    
+                    for ($x = 0; $x -lt 30; ++$x)
+                    {
+                      try
+                      {
+                        Write-Host "Making request to $URI"
+                        $response = Invoke-WebRequest -Uri $URI -UseBasicParsing
+                        $statusCode = $response.StatusCode
+                      } catch {
+                        $statusCode = $_.Exception.Response.StatusCode.value__
+                      }
+                      
+                      if ($statusCode -eq 200) {
+                      	Write-Host "Request to $URI was successful"
+                        exit 0
+                      }
+                      
+                      Write-Host "Request to $URI was unsuccessful, trying again in 10 seconds..."
+                      Start-Sleep 10
+                    }
+                    
+                    
+                    Fail-Step "Failed to make a successful request to $URI"
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "notify-stakeholders" {
+        condition = "Variable"
+        name = "📨 Notify stakeholders"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.ManualRun}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the Restart Web Site runbook in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The results of the web site check(s) were:
+                    <br><br>
+                    #{Octopus.Action[🔬 Analyze state].Output.Details | Markdown}
+                    <br><br>
+                    The web site(s) were restarted and returned successful status codes.
+                    <br><br>
+                    View the Runbook logs at #{Global.Octopus.ServerUrl}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} OctoFX sites restarted"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+        }
+    }
+}

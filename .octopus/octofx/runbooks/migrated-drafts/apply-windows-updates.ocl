@@ -1,0 +1,281 @@
+name = "⬆️ Apply Windows updates"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        **Action**: Apply OS updates to OctoFX servers and restart if needed.
+        
+        **Affects**: OctoFX Web Site, OctoFX Rate Service, Customer Success, Customer Support, Sales
+        
+        **Resolves**: OS security issues
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "check-for-updates" {
+        name = "🔍 Check for updates"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-service,octofx-web"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    function Get-NugetPackageProviderNotInstalled
+                    {
+                    	# See if the nuget package provider has been installed
+                        return ($null -eq (Get-PackageProvider -ListAvailable -Name Nuget -ErrorAction SilentlyContinue))
+                    }
+                    
+                    function Get-ModuleInstalled
+                    {
+                        # Define parameters
+                        param(
+                            $PowerShellModuleName
+                        )
+                    
+                        # Check to see if the module is installed
+                        if ($null -ne (Get-Module -ListAvailable -Name $PowerShellModuleName))
+                        {
+                            # It is installed
+                            return $true
+                        }
+                        else
+                        {
+                            # Module not installed
+                            return $false
+                        }
+                    }
+                    
+                    # Force use of TLS 1.2
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    
+                    # Check to see if the NuGet package provider is installed
+                    if ((Get-NugetPackageProviderNotInstalled) -ne $false)
+                    {
+                      # Display that we need the nuget package provider
+                      Write-Host "Nuget package provider not found, installing ..."
+                    
+                      # Install Nuget package provider
+                      Install-PackageProvider -Name Nuget -Force
+                    
+                      Write-Output "Nuget package provider succesfully installed ..."
+                    }
+                    
+                    
+                    Write-Output "Checking for PowerShell module PSWindowsUpdate ..."
+                    
+                    if ((Get-ModuleInstalled -PowerShellModuleName "PSWindowsUpdate") -ne $true)
+                    {
+                    	Write-Output "PSWindowsUpdate not found, installing ..."
+                        
+                        # Install PSWindowsUpdate
+                        Install-Module PSWindowsUpdate -Force
+                        
+                        Write-Output "Installation of PSWindowsUpdate complete ..."
+                    }
+                    
+                    Write-Output "Checking for updates ..."
+                    
+                    $updates = Get-WindowsUpdate
+                    
+                    $details = @()
+                    
+                    $updates | ForEach-Object {
+                        $details += "  * $($_.KB) - $($_.Title)"
+                    }
+                    
+                    $details = $details -join "`r`n" | Out-String
+                    Set-OctopusVariable -name Updates -Value $details
+                    Set-OctopusVariable -name NumberOfUpdates -Value $updates.Count
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "analyze-state" {
+        name = "🔬 Analyze state"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $machines = @()
+                    
+                    #{each machine in Octopus.Action[🔍 Check for updates].Output}
+                     $machines += "#{machine}"
+                    #{/each}
+                    
+                    $machines = $machines | Sort-Object
+                    
+                    $environment = $OctopusParameters["Octopus.Environment.Name"]
+                    $details = @()
+                    $total = 0
+                    
+                    $machines | ForEach-Object {
+                      $count = $OctopusParameters["Octopus.Action[🔍 Check for updates].Output[$_].NumberOfUpdates"]
+                      $updates = $OctopusParameters["Octopus.Action[🔍 Check for updates].Output[$_].Updates"]
+                      
+                      $total += $count
+                      $details += "* **$_**"
+                      $details += $updates
+                      $details += ""
+                    }
+                    
+                    $details = $details -join "`r`n" | Out-String
+                    Write-Host $details
+                    
+                    if ($count -eq 0) {
+                      Write-Highlight "There are no updates available for any of the machines in $environment."
+                    }
+                    
+                    Set-OctopusVariable -name "Details" -value $details
+                    Set-OctopusVariable -name "HasUpdates" -value ($count -gt 0)
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool = "azure-worker-pool"
+        }
+    }
+
+    step "confirm-updates" {
+        condition = "Variable"
+        name = "✅ Confirm updates"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.HasUpdates}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    We found the following updates to apply:
+                    
+                    #{Octopus.Action[🔬 Analyze state].Output.Details}
+                    
+                    Please confirm whether to continue with the updates.
+                    EOT
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "apply-windows-updates" {
+        condition = "Variable"
+        name = "⬆️ Apply Windows updates"
+        properties = {
+            Octopus.Action.TargetRoles = "octofx-service,octofx-web"
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.HasUpdates}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.RunOnServer = "false"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    function Get-NugetPackageProviderNotInstalled
+                    {
+                    	# See if the nuget package provider has been installed
+                        return ($null -eq (Get-PackageProvider -ListAvailable -Name Nuget -ErrorAction SilentlyContinue))
+                    }
+                    
+                    function Get-ModuleInstalled
+                    {
+                        # Define parameters
+                        param(
+                            $PowerShellModuleName
+                        )
+                    
+                        # Check to see if the module is installed
+                        if ($null -ne (Get-Module -ListAvailable -Name $PowerShellModuleName))
+                        {
+                            # It is installed
+                            return $true
+                        }
+                        else
+                        {
+                            # Module not installed
+                            return $false
+                        }
+                    }
+                    
+                    # Force use of TLS 1.2
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    
+                    # Check to see if the NuGet package provider is installed
+                    if ((Get-NugetPackageProviderNotInstalled) -ne $false)
+                    {
+                      # Display that we need the nuget package provider
+                      Write-Host "Nuget package provider not found, installing ..."
+                    
+                      # Install Nuget package provider
+                      Install-PackageProvider -Name Nuget -Force
+                    
+                      Write-Output "Nuget package provider succesfully installed ..."
+                    }
+                    
+                    Write-Output "Checking for PowerShell module PSWindowsUpdate ..."
+                    
+                    if ((Get-ModuleInstalled -PowerShellModuleName "PSWindowsUpdate") -ne $true)
+                    {
+                    	Write-Output "PSWindowsUpdate not found, installing ..."
+                        
+                        # Install PSWindowsUpdate
+                        Install-Module PSWindowsUpdate -Force
+                        
+                        Write-Output "Installation of PSWindowsUpdate complete ..."
+                    }
+                    
+                    Write-Output "Installing updates ..."
+                    
+                    Install-WindowsUpdate -AcceptAll -AutoReboot
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "notify-stakeholders" {
+        condition = "Variable"
+        name = "📨 Notify stakeholders"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.HasUpdates}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the OctoFX - ⬆️ Apply Windows updates runbook in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The following updates were applied:
+                    <br><br>
+                    #{Octopus.Action[🔬 Analyze state].Output.Details | Markdown}
+                    <br><br>
+                    View the Runbook logs at #{Global.Octopus.ServerUrl}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - ⬆️ Apply Windows updates to OctoFX servers"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+            worker_pool_variable = ""
+        }
+    }
+}

@@ -1,0 +1,493 @@
+name = "??? Destroy Infrastructure"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        Destroy infrastructure that isn't needed anymore.
+        
+        Affects: Random Quotes web app and database, Operations
+        
+        Resolves: Orphaned infrastructure
+        EOT
+environment_scope = "FromProjectLifecycles"
+multi_tenancy_mode = "Tenanted"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "break-leases-if-they-exist" {
+        name = "🗑️ Break leases if they exist"
+
+        action {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "tenants-azure-subscription"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $stateKey = $OctopusParameters["RandomQuotes.Terraform.StateKey"]
+                    $blobName = "random-quotes-$stateKey.terraform.tfstate"
+                    
+                    try {
+                    	az storage blob lease break --account-name "octodemotfstate" --container-name "terraform-state" --blob-name $blobName
+                    }
+                    catch {}
+                    
+                    exit 0
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "plan-destroy-infrastructure" {
+        name = "🔍 Plan destroy infrastructure with Terraform"
+
+        action "plan-destroy-infrastructure-with-terraform" {
+            action_type = "Octopus.TerraformPlanDestroy"
+            is_disabled = true
+            properties = {
+                Octopus.Action.AzureAccount.Variable = "RandomQuotes.Azure.Account"
+                Octopus.Action.GoogleCloud.ImpersonateServiceAccount = "False"
+                Octopus.Action.GoogleCloud.UseVMServiceAccount = "True"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Terraform.AllowPluginDownloads = "True"
+                Octopus.Action.Terraform.AzureAccount = "True"
+                Octopus.Action.Terraform.GoogleCloudAccount = "False"
+                Octopus.Action.Terraform.ManagedAccount = "None"
+                Octopus.Action.Terraform.PlanJsonOutput = "False"
+                Octopus.Action.Terraform.RunAutomaticFileSubstitution = "True"
+                Octopus.Action.Terraform.Template = <<-EOT
+                    terraform {
+                      backend "azurerm" {
+                        resource_group_name  = "demo.octopus.app"
+                        storage_account_name = "octodemotfstate"
+                        container_name       = "terraform-state"
+                        key                  = "random-quotes-#{RandomQuotes.Terraform.StateKey}.terraform.tfstate"
+                      }
+                    }
+                    
+                    provider "azurerm" {
+                       features {}
+                    }
+                    
+                    variable "resourcegroupname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.ResourceGroup.Name}"
+                    }
+                    
+                    variable "webappname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Name}"
+                    }
+                    
+                    variable "databaseserver" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.ServerName}"
+                    }
+                    
+                    variable "databasename" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.Name}"
+                    }
+                    
+                    variable "environment" {
+                      type = string
+                      default = "#{RandomQuotes.Environment}"
+                    }
+                    
+                    variable "location" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Location}"
+                    }
+                    
+                    variable "region" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Region}"
+                    }
+                    
+                    variable "owner" {
+                      type = string
+                      default = "#{Tenant.Key}"
+                    }
+                    
+                    variable "description" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Description}"
+                    }
+                    
+                    resource "azurerm_service_plan" "main" {
+                      name = "${var.webappname}-service-plan"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      os_type = "Linux"
+                      sku_name = "B1"
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    
+                    resource "azurerm_linux_web_app" "main" {
+                      name                = "${var.webappname}"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      service_plan_id = "${azurerm_service_plan.main.id}"
+                    
+                      site_config {
+                        
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                        octopus-environment = "#{Octopus.Environment.Name}"
+                        octopus-role = "random-quotes-web"
+                        octopus-tenant = "#{Octopus.Deployment.Tenant.Name}"
+                      }
+                    }
+                    EOT
+                Octopus.Action.Terraform.TemplateParameters = "{\"resourcegroupname\":\"#{RandomQuotes.Azure.ResourceGroup.Name}\",\"webappname\":\"#{RandomQuotes.Azure.WebApp.Name}\",\"databaseserver\":\"#{RandomQuotes.Azure.Database.ServerName}\",\"databasename\":\"#{RandomQuotes.Azure.Database.Name}\",\"environment\":\"#{RandomQuotes.Environment}\",\"location\":\"#{RandomQuotes.Tenant.Azure.Location}\",\"region\":\"#{RandomQuotes.Tenant.Azure.Region}\",\"owner\":\"#{Tenant.Key}\",\"description\":\"#{RandomQuotes.Azure.WebApp.Description}\"}"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "plan-destroy-infrastructure-with-terraform-without-emoji" {
+        name = "Plan destroy infrastructure with Terraform - without emoji"
+
+        action {
+            action_type = "Octopus.TerraformPlanDestroy"
+            properties = {
+                Octopus.Action.AzureAccount.Variable = "RandomQuotes.Azure.Account"
+                Octopus.Action.GoogleCloud.ImpersonateServiceAccount = "False"
+                Octopus.Action.GoogleCloud.UseVMServiceAccount = "True"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Terraform.AllowPluginDownloads = "True"
+                Octopus.Action.Terraform.AzureAccount = "True"
+                Octopus.Action.Terraform.GoogleCloudAccount = "False"
+                Octopus.Action.Terraform.ManagedAccount = "None"
+                Octopus.Action.Terraform.PlanJsonOutput = "False"
+                Octopus.Action.Terraform.RunAutomaticFileSubstitution = "True"
+                Octopus.Action.Terraform.Template = <<-EOT
+                    terraform {
+                      backend "azurerm" {
+                        resource_group_name  = "demo.octopus.app"
+                        storage_account_name = "octodemotfstate"
+                        container_name       = "terraform-state"
+                        key                  = "random-quotes-#{RandomQuotes.Terraform.StateKey}.terraform.tfstate"
+                      }
+                    }
+                    
+                    provider "azurerm" {
+                       features {}
+                    }
+                    
+                    variable "resourcegroupname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.ResourceGroup.Name}"
+                    }
+                    
+                    variable "webappname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Name}"
+                    }
+                    
+                    variable "databaseserver" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.ServerName}"
+                    }
+                    
+                    variable "databasename" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.Name}"
+                    }
+                    
+                    variable "environment" {
+                      type = string
+                      default = "#{RandomQuotes.Environment}"
+                    }
+                    
+                    variable "location" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Location}"
+                    }
+                    
+                    variable "region" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Region}"
+                    }
+                    
+                    variable "owner" {
+                      type = string
+                      default = "#{Tenant.Key}"
+                    }
+                    
+                    variable "description" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Description}"
+                    }
+                    
+                    resource "azurerm_service_plan" "main" {
+                      name = "${var.webappname}-service-plan"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      os_type = "Linux"
+                      sku_name = "B1"
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    
+                    resource "azurerm_linux_web_app" "main" {
+                      name                = "${var.webappname}"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      service_plan_id = "${azurerm_service_plan.main.id}"
+                    
+                      site_config {
+                        
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                        octopus-environment = "#{Octopus.Environment.Name}"
+                        octopus-role = "random-quotes-web"
+                        octopus-tenant = "#{Octopus.Deployment.Tenant.Name}"
+                      }
+                    }
+                    EOT
+                Octopus.Action.Terraform.TemplateParameters = "{\"resourcegroupname\":\"#{RandomQuotes.Azure.ResourceGroup.Name}\",\"webappname\":\"#{RandomQuotes.Azure.WebApp.Name}\",\"databaseserver\":\"#{RandomQuotes.Azure.Database.ServerName}\",\"databasename\":\"#{RandomQuotes.Azure.Database.Name}\",\"environment\":\"#{RandomQuotes.Environment}\",\"location\":\"#{RandomQuotes.Tenant.Azure.Location}\",\"region\":\"#{RandomQuotes.Tenant.Azure.Region}\",\"owner\":\"#{Tenant.Key}\",\"description\":\"#{RandomQuotes.Azure.WebApp.Description}\"}"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "analyze-state" {
+        name = "🔬 Analyze state"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $createdBy = $OctopusParameters["Octopus.Deployment.CreatedBy.Id"]
+                    $manualRun = ($createdBy -ne 'users-system')
+                    
+                    Set-OctopusVariable -name "ManualRun" -value $manualRun
+                    Set-OctopusVariable -name "NeedsConfirmation" -value $manualRun
+                    Set-OctopusVariable -name "SendNotification" -value $manualRun
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "confirm-destroy-infrastructure" {
+        condition = "Variable"
+        name = "✅ Confirm destroy infrastructure"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.NeedsConfirmation}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    Here is the Terraform plan to destroy infrastructure for #{Octopus.Deployment.Tenant.Name}.
+                    
+                    #{Octopus.Action[🔍 Plan destroy infrastructure with Terraform].Output.TerraformPlanOutput}
+                    
+                    Please confirm whether to continue destroying infrastructure.
+                    EOT
+            }
+        }
+    }
+
+    step "destroy-infrastructure" {
+        name = "🗑️ Destroy infrastructure with Terraform"
+
+        action "destroy-infrastructure-with-terraform" {
+            action_type = "Octopus.TerraformDestroy"
+            properties = {
+                Octopus.Action.AzureAccount.Variable = "RandomQuotes.Azure.Account"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Terraform.AllowPluginDownloads = "True"
+                Octopus.Action.Terraform.AzureAccount = "True"
+                Octopus.Action.Terraform.GoogleCloudAccount = "False"
+                Octopus.Action.Terraform.ManagedAccount = "None"
+                Octopus.Action.Terraform.PlanJsonOutput = "False"
+                Octopus.Action.Terraform.RunAutomaticFileSubstitution = "True"
+                Octopus.Action.Terraform.Template = <<-EOT
+                    terraform {
+                      backend "azurerm" {
+                        resource_group_name  = "demo.octopus.app"
+                        storage_account_name = "octodemotfstate"
+                        container_name       = "terraform-state"
+                        key                  = "random-quotes-#{RandomQuotes.Terraform.StateKey}.terraform.tfstate"
+                      }
+                    }
+                    
+                    provider "azurerm" {
+                       features {}
+                    }
+                    
+                    variable "resourcegroupname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.ResourceGroup.Name}"
+                    }
+                    
+                    variable "webappname" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Name}"
+                    }
+                    
+                    variable "databaseserver" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.ServerName}"
+                    }
+                    
+                    variable "databasename" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.Database.Name}"
+                    }
+                    
+                    variable "environment" {
+                      type = string
+                      default = "#{RandomQuotes.Environment}"
+                    }
+                    
+                    variable "location" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Location}"
+                    }
+                    
+                    variable "region" {
+                      type = string
+                      default = "#{RandomQuotes.Tenant.Azure.Region}"
+                    }
+                    
+                    variable "owner" {
+                      type = string
+                      default = "#{Tenant.Key}"
+                    }
+                    
+                    variable "description" {
+                      type = string
+                      default = "#{RandomQuotes.Azure.WebApp.Description}"
+                    }
+                    
+                    resource "azurerm_service_plan" "main" {
+                      name = "${var.webappname}-service-plan"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      os_type = "Linux"
+                      sku_name = "B1"
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    
+                    resource "azurerm_linux_web_app" "main" {
+                      name                = "${var.webappname}"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      service_plan_id = "${azurerm_service_plan.main.id}"
+                    
+                      site_config {
+                        
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                        octopus-environment = "#{Octopus.Environment.Name}"
+                        octopus-role = "random-quotes-web"
+                        octopus-tenant = "#{Octopus.Deployment.Tenant.Name}"
+                      }
+                    }
+                    EOT
+                Octopus.Action.Terraform.TemplateParameters = "{\"resourcegroupname\":\"#{RandomQuotes.Azure.ResourceGroup.Name}\",\"webappname\":\"#{RandomQuotes.Azure.WebApp.Name}\",\"databaseserver\":\"#{RandomQuotes.Azure.Database.ServerName}\",\"databasename\":\"#{RandomQuotes.Azure.Database.Name}\",\"environment\":\"#{RandomQuotes.Environment}\",\"location\":\"#{RandomQuotes.Tenant.Azure.Location}\",\"region\":\"#{RandomQuotes.Tenant.Azure.Region}\",\"owner\":\"#{Tenant.Key}\",\"description\":\"#{RandomQuotes.Azure.WebApp.Description}\"}"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "break-leases-if-they-exist-clone-1" {
+        name = "🗑️ Delete resources that somehow escaped the tfstate file"
+
+        action "delete-resources-that-somehow-escaped-the-tfstate-file" {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "tenants-azure-subscription"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $resourceGroup = $OctopusParameters["RandomQuotes.Azure.ResourceGroup.Name"]
+                    $webApp = $OctopusParameters["RandomQuotes.Azure.WebApp.Name"]
+                    $servicePlan = "$($webApp)-service-plan"
+                    $db = $OctopusParameters["RandomQuotes.Azure.Database.Name"]
+                    $server = $OctopusParameters["RandomQuotes.Azure.Database.ServerName"]
+                    
+                    Write-Host "Deleting $servicePlan"
+                    
+                    az appservice plan delete --name $servicePlan --resource-group $resourceGroup -y
+                    
+                    Write-Host "Deleting $db"
+                    
+                    az sql db delete --name $db --resource-group $resourceGroup --server $server -y
+                    
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "notify-stakeholders" {
+        condition = "Variable"
+        name = "📨 Notify stakeholders"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.SendNotification}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the Random Quotes - 🗑️ Destroy Infrastructure for #{Octopus.Deployment.Tenant.Name} in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The following Terraform plan was applied:
+                    <br><br>
+                    #{Octopus.Action[🔍 Plan destroy infrastructure with Terraform].Output.TerraformPlanOutput | Markdown}
+                    <br><br>
+                    View the Runbook logs at #{Octopus.Web.ServerUri}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - #{Octopus.Project.Name} - 🗑️ Destroy Infrastructure for #{Octopus.Deployment.Tenant.Name}"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+        }
+    }
+}

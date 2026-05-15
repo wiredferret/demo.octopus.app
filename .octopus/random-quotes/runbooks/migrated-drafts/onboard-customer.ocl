@@ -1,0 +1,382 @@
+name = "? Onboard Customer"
+default_guided_failure_mode = "EnvironmentDefault"
+description = <<-EOT
+        Create and configure customer infrastructure.
+        
+        Affects: Random Quotes web app and database, Operations, Customer Success
+        EOT
+environment_scope = "FromProjectLifecycles"
+multi_tenancy_mode = "Tenanted"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+    type = "Count"
+}
+
+process {
+    step "plan-create-infrastructure-with-terraform" {
+        name = "🔍 Plan create infrastructure with Terraform"
+
+        action {
+            action_type = "Octopus.TerraformPlan"
+            properties = {
+                Octopus.Action.AzureAccount.Variable = "RandomQuotes.Azure.Account"
+                Octopus.Action.GoogleCloud.ImpersonateServiceAccount = "False"
+                Octopus.Action.GoogleCloud.UseVMServiceAccount = "True"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Terraform.AllowPluginDownloads = "True"
+                Octopus.Action.Terraform.AzureAccount = "True"
+                Octopus.Action.Terraform.GoogleCloudAccount = "False"
+                Octopus.Action.Terraform.ManagedAccount = "None"
+                Octopus.Action.Terraform.PlanJsonOutput = "False"
+                Octopus.Action.Terraform.RunAutomaticFileSubstitution = "True"
+                Octopus.Action.Terraform.Template = <<-EOT
+                    terraform {
+                      backend "azurerm" {
+                        resource_group_name  = "demo.octopus.app"
+                        storage_account_name = "octodemotfstate"
+                        container_name       = "terraform-state"
+                        key                  = "random-quotes-#{RandomQuotes.Terraform.StateKey}.terraform.tfstate"
+                      }
+                    }
+                    
+                    provider "azurerm" {
+                       features {}
+                    }
+                    
+                    variable "resourcegroupname" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.ResourceGroup.Name}"
+                    }
+                    
+                    variable "webappname" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.WebApp.Name}"
+                    }
+                    
+                    variable "databaseserver" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.Database.ServerName}"
+                    }
+                    
+                    variable "databasename" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.Database.Name}"
+                    }
+                    
+                    variable "environment" {
+                      type = "string"
+                      default = "#{RandomQuotes.Environment}"
+                    }
+                    
+                    variable "location" {
+                      type = "string"
+                      default = "#{RandomQuotes.Tenant.Azure.Location}"
+                    }
+                    
+                    variable "region" {
+                      type = "string"
+                      default = "#{RandomQuotes.Tenant.Azure.Region}"
+                    }
+                    
+                    variable "owner" {
+                      type = "string"
+                      default = "#{Tenant.Key}"
+                    }
+                    
+                    variable "description" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.WebApp.Description}"
+                    }
+                    
+                    resource "azurerm_app_service_plan" "main" {
+                      name = "${var.webappname}-service-plan"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      kind = "Linux"
+                      reserved = true
+                    
+                      sku {
+                        tier = "Basic"
+                        size = "B1"
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    
+                    resource "azurerm_app_service" "main" {
+                      name                = "${var.webappname}"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      app_service_plan_id = "${azurerm_app_service_plan.main.id}"
+                    
+                      site_config {
+                        linux_fx_version = "DOTNETCORE|3.1"
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                        octopus-environment = "#{Octopus.Environment.Name}"
+                        octopus-role = "random-quotes-web"
+                        octopus-tenant = "#{Octopus.Deployment.Tenant.Name}"
+                      }
+                    }
+                    
+                    resource "azurerm_sql_database" "main" {
+                      name                = "${var.databasename}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      location            = "${var.location}"
+                      server_name         = "${var.databaseserver}"
+                      edition             = "Basic"
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    EOT
+                Octopus.Action.Terraform.TemplateParameters = "{\"resourcegroupname\":\"#{RandomQuotes.Azure.ResourceGroup.Name}\",\"webappname\":\"#{RandomQuotes.Azure.WebApp.Name}\",\"databaseserver\":\"#{RandomQuotes.Azure.Database.ServerName}\",\"databasename\":\"#{RandomQuotes.Azure.Database.Name}\",\"environment\":\"#{RandomQuotes.Environment}\",\"location\":\"#{RandomQuotes.Tenant.Azure.Location}\",\"region\":\"#{RandomQuotes.Tenant.Azure.Region}\",\"owner\":\"#{Tenant.Key}\",\"description\":\"#{RandomQuotes.Azure.WebApp.Description}\"}"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "analyze-state" {
+        name = "🔬 Analyze state"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $createdBy = $OctopusParameters["Octopus.Deployment.CreatedBy.Id"]
+                    $manualRun = ($createdBy -ne 'users-system')
+                    
+                    Set-OctopusVariable -name "ManualRun" -value $manualRun
+                    Set-OctopusVariable -name "NeedsConfirmation" -value $manualRun
+                    Set-OctopusVariable -name "SendNotification" -value $manualRun
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "confirm-destroy-infrastructure" {
+        condition = "Variable"
+        name = "✅ Confirm create infrastructure"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.NeedsConfirmation}#{/unless}"
+        }
+
+        action "confirm-create-infrastructure" {
+            action_type = "Octopus.Manual"
+            properties = {
+                Octopus.Action.Manual.BlockConcurrentDeployments = "False"
+                Octopus.Action.Manual.Instructions = <<-EOT
+                    Here is the Terraform plan to create infrastructure for #{Octopus.Deployment.Tenant.Name}.
+                    
+                    #{Octopus.Action[🔍 Plan create infrastructure with Terraform].Output.TerraformPlanOutput}
+                    
+                    Please confirm whether to continue creating infrastructure.
+                    EOT
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "create-infrastructure" {
+        name = "➕ Create infrastructure"
+
+        action {
+            action_type = "Octopus.TerraformApply"
+            properties = {
+                Octopus.Action.AzureAccount.Variable = "RandomQuotes.Azure.Account"
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Terraform.AllowPluginDownloads = "True"
+                Octopus.Action.Terraform.AzureAccount = "True"
+                Octopus.Action.Terraform.GoogleCloudAccount = "False"
+                Octopus.Action.Terraform.ManagedAccount = "None"
+                Octopus.Action.Terraform.PlanJsonOutput = "False"
+                Octopus.Action.Terraform.RunAutomaticFileSubstitution = "True"
+                Octopus.Action.Terraform.Template = <<-EOT
+                    terraform {
+                      backend "azurerm" {
+                        resource_group_name  = "demo.octopus.app"
+                        storage_account_name = "octodemotfstate"
+                        container_name       = "terraform-state"
+                        key                  = "random-quotes-#{RandomQuotes.Terraform.StateKey}.terraform.tfstate"
+                      }
+                    }
+                    
+                    provider "azurerm" {
+                       features {}
+                    }
+                    
+                    variable "resourcegroupname" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.ResourceGroup.Name}"
+                    }
+                    
+                    variable "webappname" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.WebApp.Name}"
+                    }
+                    
+                    variable "databaseserver" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.Database.ServerName}"
+                    }
+                    
+                    variable "databasename" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.Database.Name}"
+                    }
+                    
+                    variable "environment" {
+                      type = "string"
+                      default = "#{RandomQuotes.Environment}"
+                    }
+                    
+                    variable "location" {
+                      type = "string"
+                      default = "#{RandomQuotes.Tenant.Azure.Location}"
+                    }
+                    
+                    variable "region" {
+                      type = "string"
+                      default = "#{RandomQuotes.Tenant.Azure.Region}"
+                    }
+                    
+                    variable "owner" {
+                      type = "string"
+                      default = "#{Tenant.Key}"
+                    }
+                    
+                    variable "description" {
+                      type = "string"
+                      default = "#{RandomQuotes.Azure.WebApp.Description}"
+                    }
+                    
+                    resource "azurerm_app_service_plan" "main" {
+                      name = "${var.webappname}-service-plan"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      kind = "Linux"
+                      reserved = true
+                    
+                      sku {
+                        tier = "Basic"
+                        size = "B1"
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    
+                    resource "azurerm_app_service" "main" {
+                      name                = "${var.webappname}"
+                      location = "${var.location}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      app_service_plan_id = "${azurerm_app_service_plan.main.id}"
+                    
+                      site_config {
+                        linux_fx_version = "DOTNETCORE|3.1"
+                      }
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                        octopus-environment = "#{Octopus.Environment.Name}"
+                        octopus-role = "random-quotes-web"
+                        octopus-tenant = "#{Octopus.Deployment.Tenant.Name}"
+                      }
+                    }
+                    
+                    resource "azurerm_sql_database" "main" {
+                      name                = "${var.databasename}"
+                      resource_group_name = "${var.resourcegroupname}"
+                      location            = "${var.location}"
+                      server_name         = "${var.databaseserver}"
+                      edition             = "Basic"
+                    
+                      tags = {
+                        description = "${var.description}"
+                        environment = "${var.environment}"
+                        owner       = "${var.owner}"
+                      }
+                    }
+                    EOT
+                Octopus.Action.Terraform.TemplateParameters = "{\"resourcegroupname\":\"#{RandomQuotes.Azure.ResourceGroup.Name}\",\"webappname\":\"#{RandomQuotes.Azure.WebApp.Name}\",\"databaseserver\":\"#{RandomQuotes.Azure.Database.ServerName}\",\"databasename\":\"#{RandomQuotes.Azure.Database.Name}\",\"environment\":\"#{RandomQuotes.Environment}\",\"location\":\"#{RandomQuotes.Tenant.Azure.Location}\",\"region\":\"#{RandomQuotes.Tenant.Azure.Region}\",\"owner\":\"#{Tenant.Key}\",\"description\":\"#{RandomQuotes.Azure.WebApp.Description}\"}"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "set-website-webdeploy-use-scm-to-false" {
+        name = "🛠️ Configure infrastructure"
+
+        action "configure-infrastructure" {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "#{RandomQuotes.Azure.Account}"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    $resourceGroup = $OctopusParameters["RandomQuotes.Azure.ResourceGroup.Name"]
+                    $webApp = $OctopusParameters["RandomQuotes.Azure.WebApp.Name"]
+                    
+                    az webapp config appsettings set --settings WEBSITE_WEBDEPLOY_USE_SCM=false -n $webApp -g $resourceGroup | Out-Null
+                    
+                    Write-Host "WEBSITE_WEBDEPLOY_USE_SCM set to false"
+                    Write-Host "Azure Web App ${webApp} configured"
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = "RandomQuotes.WorkerPool"
+        }
+    }
+
+    step "notify-stakeholders" {
+        condition = "Variable"
+        name = "📨 Notify stakeholders"
+        properties = {
+            Octopus.Step.ConditionVariableExpression = "#{unless Octopus.Deployment.Error}#{Octopus.Action[🔬 Analyze state].Output.SendNotification}#{/unless}"
+        }
+
+        action {
+            action_type = "Octopus.Email"
+            properties = {
+                Octopus.Action.Email.Body = <<-EOT
+                    #{Octopus.Deployment.CreatedBy.DisplayName} initiated the Random Quotes - 🗑️ Destroy Infrastructure for #{Octopus.Deployment.Tenant.Name} in #{Octopus.Environment.Name}.
+                    <br><br>
+                    The following Terraform plan was applied:
+                    <br><br>
+                    #{Octopus.Action[🔍 Plan create infrastructure with Terraform].Output.TerraformPlanOutput | Markdown}
+                    <br><br>
+                    View the Runbook logs at #{Octopus.Web.ServerUri}#{Octopus.Web.RunbookRunLink}
+                    EOT
+                Octopus.Action.Email.IsHtml = "True"
+                Octopus.Action.Email.Priority = "High"
+                Octopus.Action.Email.Subject = "#{Octopus.Environment.Name} - #{Octopus.Project.Name} - ➕ Onboard Customer for #{Octopus.Deployment.Tenant.Name}"
+                Octopus.Action.Email.To = "#{Octopus.Deployment.CreatedBy.EmailAddress}"
+            }
+            worker_pool_variable = ""
+        }
+    }
+}
